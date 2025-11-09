@@ -551,6 +551,64 @@ const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname,"../frontend/build")));
 app.get("*",(req,res) => res.sendFile(path.join(__dirname,"../frontend/build","index.html")));
 */
+/* --------------------
+  New endpoint: /api/watch-ad
+  Tracks ads watched and auto-rewards ROI when all 5 are done
+---------------------*/
+app.post("/api/watch-ad", (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ success: false, message: "Missing userId" });
+
+    const user = findUserById(userId);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    if (!user.packageId) return res.status(400).json({ success: false, message: "You must subscribe to a package first" });
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    // init tracking if not exist
+    if (!adsWatched[userId]) adsWatched[userId] = {};
+    if (!adsWatched[userId][today]) adsWatched[userId][today] = { count: 0, rewarded: false };
+
+    const userAds = adsWatched[userId][today];
+
+    // Check if already rewarded
+    if (userAds.rewarded) {
+      return res.json({ success: false, message: "Today's ROI already credited", watched: 5 });
+    }
+
+    // Increment watch count
+    if (userAds.count >= 5) {
+      return res.json({ success: false, message: "Daily ad limit reached", watched: 5 });
+    }
+
+    userAds.count += 1;
+
+    // When 5 ads watched, credit ROI
+    if (userAds.count === 5) {
+      const pkg = PACKAGES.find(p => p.id === user.packageId);
+      if (pkg) {
+        user.balance = (user.balance || 0) + pkg.daily; // credit ROI
+        userAds.rewarded = true;
+        console.log(`💰 Credited ₦${pkg.daily} ROI to ${user.email}`);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message:
+        userAds.count === 5
+          ? "✅ You’ve completed today’s 5 ads. ROI credited to your wallet!"
+          : `Ad ${userAds.count}/5 watched successfully.`,
+      watched: userAds.count,
+      rewarded: userAds.rewarded,
+      newBalance: user.balance,
+    });
+  } catch (err) {
+    console.error("watch-ad err", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => console.log(`🚀 HIGHTECH backend listening on ${PORT}`));
