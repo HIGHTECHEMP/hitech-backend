@@ -121,59 +121,7 @@ app.get("/api/siteinfo", (req,res) => {
 ---------------------*/
 
 // ✅ SIGNUP — no email verification
-app.post("/api/auth/signup", async (req, res) => {
-  try {
-    const { email, name, password, referralCode } = req.body;
-    if (!email || !name || !password) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
-    }
 
-    // check if already exists
-    const existingUser = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: "User already exists" });
-    }
-
-    // create user directly (verified = true)
-    const id = "u_" + Date.now();
-    const referralCodeGenerated = (email.split("@")[0] + Math.floor(Math.random() * 9000 + 1000)).toUpperCase();
-
-    const newUser = {
-      id,
-      name,
-      email: email.toLowerCase(),
-      password,
-      verified: true, // ✅ auto-verified now
-      balance: 0,
-      referralEarnings: 0,
-      referrals: [],
-      referralCode: referralCodeGenerated,
-      referredBy: referralCode || null,
-      packageId: null,
-      subscribedAt: null,
-      lastEarningWithdrawal: null,
-      createdAt: new Date(),
-    };
-    users.push(newUser);
-
-    // link referral if exists
-    if (referralCode) {
-      const referrer = users.find(u => u.referralCode === referralCode);
-      if (referrer) referrer.referrals.push(newUser.id);
-    }
-
-    // no email sending here
-    console.log(`✅ New user created: ${email}`);
-
-    return res.json({
-      success: true,
-      message: "Signup successful — you can now log in!",
-    });
-  } catch (err) {
-    console.error("signup err", err);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
 
 
 
@@ -241,41 +189,55 @@ app.post("/api/subscribe", (req,res) => {
   Deposit (Flutterwave init) + callback verify and auto-credit
 ---------------------*/
 
-app.post("/api/deposit", async (req,res) => {
+app.post("/api/deposit", async (req, res) => {
   try {
     const { email, amount, name } = req.body;
+
     if (!amount || Number(amount) < 5000) {
-      return res.status(400).json({ success:false, message:"Minimum deposit is ₦5,000" });
+      return res.status(400).json({ success: false, message: "Minimum deposit is ₦5,000" });
     }
-    // If promo remaining and amount qualifies, mark promoApplied true for deposit record later on callback
+
+    // Flutterwave payment init
     const response = await fetch("https://api.flutterwave.com/v3/payments", {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`, "Content-Type":"application/json" },
+      headers: {
+        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         tx_ref: "hitech_" + Date.now(),
         amount: String(amount),
         currency: "NGN",
-        redirect_url: `${process.env.BASE_URL || "http://localhost:5001"}/api/payment/callback`,
+        // ✅ LIVE REDIRECT URL FIXED HERE
+        redirect_url: `https://hitech-backend.onrender.com/api/payment/callback`,
         customer: { email, name },
-        customizations: { title: "HIGHTECH Deposit", description: "Fund your account" }
-      })
+        customizations: {
+          title: "HIGHTECH Deposit",
+          description: "Fund your account",
+        },
+      }),
     });
+
     const data = await response.json();
-    if (data.status === "success") return res.json({ success:true, link: data.data.link });
-    return res.status(400).json({ success:false, message: data.message || "Failed to init payment" });
+    if (data.status === "success") {
+      return res.json({ success: true, link: data.data.link });
+    }
+
+    return res.status(400).json({ success: false, message: data.message || "Failed to init payment" });
   } catch (err) {
     console.error("deposit err", err);
-    return res.status(500).json({ success:false, message:"Server error" });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
+
 // callback from flutterwave
-app.get("/api/payment/callback", async (req,res) => {
+app.get("/api/payment/callback", async (req, res) => {
   try {
     const { status, transaction_id, tx_ref } = req.query;
     if (status !== "successful") return res.send("<h2>Payment not successful</h2>");
 
-    // verify with flutterwave
+    // ✅ Verify transaction with Flutterwave
     const verifyRes = await fetch(`https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`, {
       headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` }
     });
@@ -289,7 +251,7 @@ app.get("/api/payment/callback", async (req,res) => {
     const email = (customer?.email || "").toLowerCase();
     let user = findUserByEmail(email);
 
-    // if user doesn't exist yet, create and auto-verify (demo)
+    // ✅ Auto-create user if not found
     if (!user) {
       user = {
         id: "u_" + Date.now(),
@@ -300,31 +262,44 @@ app.get("/api/payment/callback", async (req,res) => {
         balance: 0,
         referralEarnings: 0,
         referrals: [],
-        referralCode: (email.split("@")[0] + Math.floor(Math.random()*9000)).toUpperCase(),
-        createdAt: new Date()
+        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase(),
+        createdAt: new Date(),
       };
       users.push(user);
     }
 
-    // credit balance
+    // ✅ Credit deposit amount to balance
     user.balance = (user.balance || 0) + Number(amount);
 
-    // record deposit and check if promo applies
+    // ✅ Record deposit and check promo
     let promoApplied = false;
     if (promo.used < promo.limit) {
       promo.used += 1;
       promoApplied = true;
     }
-    const dep = { id: uuidv4(), userId: user.id, amount: Number(amount), txId: transaction_id, txRef: tx_ref || null, status: "successful", createdAt: new Date(), promoApplied };
+
+    const dep = {
+      id: uuidv4(),
+      userId: user.id,
+      amount: Number(amount),
+      txId: transaction_id,
+      txRef: tx_ref || null,
+      status: "successful",
+      createdAt: new Date(),
+      promoApplied,
+    };
     deposits.push(dep);
 
-    // return success page
-    return res.send(`<h2>Payment Successful ✅</h2><p>₦${amount} credited to ${email}</p><p><a href="${process.env.FRONTEND_URL || 'http://localhost:8080'}">Return to site</a></p>`);
+    console.log(`✅ Deposit credited: ₦${amount} for ${email} (Promo: ${promoApplied})`);
+
+    // ✅ Redirect to live frontend dashboard
+    return res.redirect("https://hightechemp.site/dashboard");
   } catch (err) {
     console.error("callback err", err);
     return res.status(500).send("<h2>Error verifying payment</h2>");
   }
 });
+
 
 /* --------------------
   Webhook (flutterwave)
