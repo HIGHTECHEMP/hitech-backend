@@ -9,7 +9,15 @@ import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://hightechemp.site", // your frontend (Hostinger)
+    "https://www.hightechemp.site" // optional, in case www version is used
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  credentials: true,
+}));
+
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
