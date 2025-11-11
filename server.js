@@ -6,6 +6,13 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import nodemailer from "nodemailer";
 import { v4 as uuidv4 } from "uuid";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_FILE = path.join(__dirname, "data.json");
 
 dotenv.config();
 const app = express();
@@ -34,6 +41,38 @@ const withdrawals = [];
 const adsWatched = {}; // { userId: { yyyy-mm-dd: count } }
 const verifications = {}; // email -> code
 const promo = { limit: Number(process.env.PROMO_LIMIT || 300), used: 0 };
+// ======= ADD: Persistence Helpers =======
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf-8");
+      const json = JSON.parse(raw);
+
+      if (json.users) users.push(...json.users);
+      if (json.deposits) deposits.push(...json.deposits);
+      if (json.withdrawals) withdrawals.push(...json.withdrawals);
+      if (json.promo) {
+        promo.limit = json.promo.limit;
+        promo.used = json.promo.used;
+      }
+      console.log("✅ Data loaded from data.json");
+    } else {
+      console.log("ℹ️ No existing data.json found. Starting fresh.");
+    }
+  } catch (err) {
+    console.error("❌ Error loading data.json:", err);
+  }
+}
+
+function saveData() {
+  try {
+    const data = { users, deposits, withdrawals, promo };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    console.log("💾 Data saved successfully");
+  } catch (err) {
+    console.error("❌ Error saving data:", err);
+  }
+}
 
 // Packages (exact amounts you requested)
 const PACKAGES = [
@@ -155,7 +194,8 @@ app.post("/api/auth/signup", (req, res) => {
     };
     users.push(newUser);
 
-    console.log(`✅ New signup: ${email}`);
+    console.log(`✅ New signup: ${email}`);saveData();
+
 
     return res.json({
       success: true,
@@ -191,6 +231,34 @@ app.post("/api/auth/login", (req,res) => {
   const safe = { id: user.id, name: user.name, email: user.email, balance: user.balance, referralEarnings: user.referralEarnings, referralCode: user.referralCode, packageId: user.packageId, subscribedAt: user.subscribedAt };
   return res.json({ success:true, user: safe });
 });
+app.get("/api/referrals/:userId", (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = users.find(u => u.id === userId);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Fetch referred users
+    const referredUsers = users.filter(u => u.referredBy === user.referralCode);
+
+    return res.json({
+      success: true,
+      count: referredUsers.length,
+      referrals: referredUsers.map(r => ({
+        id: r.id,
+        name: r.name,
+        email: r.email,
+        joinedAt: r.createdAt,
+      })),
+    });
+  } catch (err) {
+    console.error("Error fetching referrals:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 
 /* --------------------
   Packages & subscription
@@ -212,7 +280,8 @@ app.post("/api/subscribe", (req,res) => {
   // deduct price, set subscription date
   user.balance -= pkg.price;
   user.packageId = pkg.id;
-  user.subscribedAt = new Date();
+  user.subscribedAt = new Date();saveData();
+
 
   // credit referral: 10% of package price to referrer (immediate)
   if (user.referredBy) {
@@ -273,17 +342,17 @@ app.post("/api/deposit", async (req, res) => {
 });
 
 
-// callback from flutterwave
 app.get("/api/payment/callback", async (req, res) => {
   try {
     const { status, transaction_id, tx_ref } = req.query;
     if (status !== "successful") return res.send("<h2>Payment not successful</h2>");
 
-    // ✅ Verify transaction with Flutterwave
+    // verify with flutterwave
     const verifyRes = await fetch(`https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`, {
       headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` }
     });
     const verifyData = await verifyRes.json();
+
     if (!verifyData || verifyData.status !== "success") {
       console.error("verifyData", verifyData);
       return res.send("<h2>Payment verification failed</h2>");
@@ -293,7 +362,7 @@ app.get("/api/payment/callback", async (req, res) => {
     const email = (customer?.email || "").toLowerCase();
     let user = findUserByEmail(email);
 
-    // ✅ Auto-create user if not found
+    // auto-create if missing
     if (!user) {
       user = {
         id: "u_" + Date.now(),
@@ -304,22 +373,30 @@ app.get("/api/payment/callback", async (req, res) => {
         balance: 0,
         referralEarnings: 0,
         referrals: [],
-        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase(),
-        createdAt: new Date(),
+        referralCode: (email.split("@")[0] + Math.floor(Math.random()*9000)).toUpperCase(),
+        createdAt: new Date()
       };
       users.push(user);
     }
 
-    // ✅ Credit deposit amount to balance
+    // credit balance
     user.balance = (user.balance || 0) + Number(amount);
 
-    // ✅ Record deposit and check promo
+    // referral bonus (10%)
+    if (user.referredBy) {
+      const referrer = users.find(u => u.referralCode === user.referredBy);
+      if (referrer) {
+        const bonus = Number(amount) * 0.1;
+        referrer.referralEarnings = (referrer.referralEarnings || 0) + bonus;
+      }
+    }
+
+    // record deposit and promo
     let promoApplied = false;
     if (promo.used < promo.limit) {
       promo.used += 1;
       promoApplied = true;
     }
-
     const dep = {
       id: uuidv4(),
       userId: user.id,
@@ -328,19 +405,20 @@ app.get("/api/payment/callback", async (req, res) => {
       txRef: tx_ref || null,
       status: "successful",
       createdAt: new Date(),
-      promoApplied,
+      promoApplied
     };
-    deposits.push(dep);
+    deposits.push(dep);saveData();
 
-    console.log(`✅ Deposit credited: ₦${amount} for ${email} (Promo: ${promoApplied})`);
 
-    // ✅ Redirect to live frontend dashboard
-    return res.redirect("https://hightechemp.site/dashboard");
+    // ✅ Redirect to frontend dashboard
+    const redirectUrl = `${process.env.FRONTEND_URL}/dashboard?success=true`;
+    return res.redirect(redirectUrl);
   } catch (err) {
     console.error("callback err", err);
     return res.status(500).send("<h2>Error verifying payment</h2>");
   }
 });
+
 
 
 /* --------------------
@@ -445,7 +523,8 @@ app.post("/api/withdraw", async (req,res) => {
 
     // create withdraw request (admin will approve)
     const w = { id: uuidv4(), userId: user.id, type, amount: amt, bank, accountNumber, accountName, status: "pending", createdAt: new Date() };
-    withdrawals.push(w);
+    withdrawals.push(w);saveData();
+
 
     // notify admin by email
     const subject = `New withdrawal request (${type}) ₦${amt}`;
@@ -472,7 +551,7 @@ app.post("/api/admin/withdrawals/:id/approve", (req,res) => {
   const id = req.params.id;
   const w = withdrawals.find(x => x.id === id);
   if (!w) return res.status(404).json({ success:false, message:"Not found" });
-  w.status = "approved";
+  w.status = "approved";saveData();
   // In production: call payout API or mark as paid after manual transfer
   return res.json({ success:true, w });
 });
@@ -634,6 +713,7 @@ app.post("/api/watch-ad", (req, res) => {
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
-
+// ======= ADD: Load saved data at startup =======
+loadData();
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 HIGHTECH backend listening on ${PORT}`));
