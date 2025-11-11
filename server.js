@@ -119,8 +119,6 @@ app.get("/api/siteinfo", (req,res) => {
 /* --------------------
   Auth & verification
 ---------------------*/
-
-
 // ✅ SIGNUP — no email verification
 app.post("/api/auth/signup", (req, res) => {
   try {
@@ -129,12 +127,10 @@ app.post("/api/auth/signup", (req, res) => {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
-    // Check if user already exists
     if (findUserByEmail(email)) {
       return res.status(400).json({ success: false, message: "Email already registered" });
     }
 
-    // Handle referral
     let referredBy = null;
     if (referralCode) {
       const refUser = users.find(u => u.referralCode === referralCode);
@@ -144,13 +140,12 @@ app.post("/api/auth/signup", (req, res) => {
       }
     }
 
-    // Create user
     const newUser = {
       id: "u_" + Date.now(),
       name,
       email: email.toLowerCase(),
       password,
-      verified: true, // you can toggle this to false if you later add email verification
+      verified: true,
       balance: 0,
       referralEarnings: 0,
       referrals: [],
@@ -162,14 +157,17 @@ app.post("/api/auth/signup", (req, res) => {
 
     console.log(`✅ New signup: ${email}`);
 
-    return res.json({ success: true, message: "Signup successful", user: { id: newUser.id, email: newUser.email, name: newUser.name } });
+    return res.json({
+      success: true,
+      message: "Signup successful",
+      user: { id: newUser.id, email: newUser.email, name: newUser.name },
+    });
   } catch (err) {
     console.error("Signup error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// verify code
 app.post("/api/auth/verify", (req,res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ success:false, message:"Missing fields" });
