@@ -9,12 +9,28 @@ import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import mongoose from "mongoose";
+import User from "./models/User.js";
+import Deposit from "./models/Deposit.js";
+import Promo from "./models/Promo.js";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+// ✅ Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log("✅ MongoDB connected successfully"))
+.catch(err => console.error("❌ MongoDB connection failed:", err));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_FILE = path.join(__dirname, "data.json");
 
 dotenv.config();
+const FRONTEND_URL = "https://hightechemp.site";
 const app = express();
 app.use(cors({
   origin: [
@@ -233,17 +249,10 @@ app.post("/api/auth/login", (req,res) => {
 });
 app.get("/api/referrals/:userId", (req, res) => {
   try {
-    const { userId } = req.params;
-    const user = users.find(u => u.id === userId);
-
-    if (!user) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
-
-    // Fetch referred users
+    const user = findUserById(req.params.userId);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
     const referredUsers = users.filter(u => u.referredBy === user.referralCode);
-
-    return res.json({
+    res.json({
       success: true,
       count: referredUsers.length,
       referrals: referredUsers.map(r => ({
@@ -254,7 +263,7 @@ app.get("/api/referrals/:userId", (req, res) => {
       })),
     });
   } catch (err) {
-    console.error("Error fetching referrals:", err);
+    console.error("Referral error:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
@@ -303,12 +312,10 @@ app.post("/api/subscribe", (req,res) => {
 app.post("/api/deposit", async (req, res) => {
   try {
     const { email, amount, name } = req.body;
+    if (!amount || Number(amount) < 5000)
+      return res.status(400).json({ success: false, message: "Minimum ₦5,000" });
 
-    if (!amount || Number(amount) < 5000) {
-      return res.status(400).json({ success: false, message: "Minimum deposit is ₦5,000" });
-    }
-
-    // Flutterwave payment init
+    const tx_ref = "hitech_" + Date.now();
     const response = await fetch("https://api.flutterwave.com/v3/payments", {
       method: "POST",
       headers: {
@@ -316,28 +323,21 @@ app.post("/api/deposit", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        tx_ref: "hitech_" + Date.now(),
+        tx_ref,
         amount: String(amount),
         currency: "NGN",
-        // ✅ LIVE REDIRECT URL FIXED HERE
         redirect_url: `https://hitech-backend.onrender.com/api/payment/callback`,
         customer: { email, name },
-        customizations: {
-          title: "HIGHTECH Deposit",
-          description: "Fund your account",
-        },
+        customizations: { title: "HIGHTECH Deposit" },
       }),
     });
 
     const data = await response.json();
-    if (data.status === "success") {
-      return res.json({ success: true, link: data.data.link });
-    }
-
-    return res.status(400).json({ success: false, message: data.message || "Failed to init payment" });
+    if (data.status === "success") return res.json({ success: true, link: data.data.link });
+    res.status(400).json({ success: false, message: data.message || "Failed to init payment" });
   } catch (err) {
-    console.error("deposit err", err);
-    return res.status(500).json({ success: false, message: "Server error" });
+    console.error("Deposit error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
@@ -345,7 +345,14 @@ app.post("/api/deposit", async (req, res) => {
 app.get("/api/payment/callback", async (req, res) => {
   try {
     const { status, transaction_id, tx_ref } = req.query;
-    if (status !== "successful") return res.send("<h2>Payment not successful</h2>");
+
+    // log incoming callback for debugging
+    console.log("🔔 Payment callback received:", { status, transaction_id, tx_ref });
+
+    if (status !== "successful") {
+      // better to redirect to frontend so UX is smooth
+      return res.redirect(`${FRONTEND_URL}/dashboard?payment=cancelled`);
+    }
 
     // verify with flutterwave
     const verifyRes = await fetch(`https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`, {
@@ -353,16 +360,18 @@ app.get("/api/payment/callback", async (req, res) => {
     });
     const verifyData = await verifyRes.json();
 
+    console.log("🔍 verifyData:", verifyData && verifyData.status ? "OK" : verifyData);
+
     if (!verifyData || verifyData.status !== "success") {
-      console.error("verifyData", verifyData);
-      return res.send("<h2>Payment verification failed</h2>");
+      console.error("verifyData failed:", verifyData);
+      return res.redirect(`${FRONTEND_URL}/dashboard?payment=failed`);
     }
 
     const { amount, customer } = verifyData.data;
     const email = (customer?.email || "").toLowerCase();
-    let user = findUserByEmail(email);
 
-    // auto-create if missing
+    // find or create user
+    let user = findUserByEmail(email);
     if (!user) {
       user = {
         id: "u_" + Date.now(),
@@ -373,7 +382,7 @@ app.get("/api/payment/callback", async (req, res) => {
         balance: 0,
         referralEarnings: 0,
         referrals: [],
-        referralCode: (email.split("@")[0] + Math.floor(Math.random()*9000)).toUpperCase(),
+        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase(),
         createdAt: new Date()
       };
       users.push(user);
@@ -382,24 +391,27 @@ app.get("/api/payment/callback", async (req, res) => {
     // credit balance
     user.balance = (user.balance || 0) + Number(amount);
 
-    // referral bonus (10%)
+    // referral bonus (10%) - credit immediately and persist
     if (user.referredBy) {
       const referrer = users.find(u => u.referralCode === user.referredBy);
       if (referrer) {
-        const bonus = Number(amount) * 0.1;
+        const bonus = Math.round(Number(amount) * 0.10);
         referrer.referralEarnings = (referrer.referralEarnings || 0) + bonus;
+        console.log(`🎉 Credited referral bonus ${bonus} to ${referrer.email}`);
       }
     }
 
-    // record deposit and promo
+    // record deposit and promo usage
     let promoApplied = false;
     if (promo.used < promo.limit) {
       promo.used += 1;
       promoApplied = true;
     }
+
     const dep = {
       id: uuidv4(),
       userId: user.id,
+      email,                    // store email so you can look up easily later
       amount: Number(amount),
       txId: transaction_id,
       txRef: tx_ref || null,
@@ -407,19 +419,19 @@ app.get("/api/payment/callback", async (req, res) => {
       createdAt: new Date(),
       promoApplied
     };
-    deposits.push(dep);saveData();
+    deposits.push(dep);
 
+    // persist everything now
+    saveData();
 
-    // ✅ Redirect to frontend dashboard
-    const redirectUrl = `${process.env.FRONTEND_URL}/dashboard?success=true`;
-    return res.redirect(redirectUrl);
+    // redirect to frontend dashboard (success)
+    return res.redirect(`${FRONTEND_URL}/dashboard?payment=success`);
   } catch (err) {
-    console.error("callback err", err);
-    return res.status(500).send("<h2>Error verifying payment</h2>");
+    console.error("callback err:", err);
+    // fail gracefully: redirect user to frontend error state
+    return res.redirect(`${FRONTEND_URL}/dashboard?payment=error`);
   }
 });
-
-
 
 /* --------------------
   Webhook (flutterwave)
