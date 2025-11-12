@@ -13,7 +13,6 @@ import mongoose from "mongoose";
 import User from "./models/User.js";
 import Deposit from "./models/Deposit.js";
 import Promo from "./models/Promo.js";
-import dotenv from "dotenv";
 
 dotenv.config();
 
