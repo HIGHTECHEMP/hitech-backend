@@ -9,20 +9,9 @@ import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import mongoose from "mongoose";
-import User from "./models/User.js";
-import Deposit from "./models/Deposit.js";
-import Promo from "./models/Promo.js";
 
 dotenv.config();
 
-// ✅ Connect to MongoDB
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log("✅ MongoDB connected successfully"))
-.catch(err => console.error("❌ MongoDB connection failed:", err));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
