@@ -6,79 +6,110 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import nodemailer from "nodemailer";
 import { v4 as uuidv4 } from "uuid";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import mongoose from "mongoose";
 
 dotenv.config();
 
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://hightechemp.site";
+const MONGO_URI = process.env.MONGO_URI;
+const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DATA_FILE = path.join(__dirname, "data.json");
+if (!MONGO_URI) {
+  console.error("❌ MONGO_URI not set in .env");
+  process.exit(1);
+}
 
-dotenv.config();
-const FRONTEND_URL = "https://hightechemp.site";
+mongoose.connect(MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch(err => {
+    console.error("❌ MongoDB connection error", err);
+    process.exit(1);
+  });
+
+/* ---------------------
+  Schemas
+----------------------*/
+const { Schema } = mongoose;
+
+const UserSchema = new Schema({
+  name: String,
+  email: { type: String, lowercase: true, index: true, unique: true },
+  password: String,
+  verified: { type: Boolean, default: true },
+  balance: { type: Number, default: 0 },
+  referralEarnings: { type: Number, default: 0 },
+  referrals: { type: [String], default: [] },
+  referralCode: { type: String, index: true },
+  referredBy: { type: String, default: null },
+  packageId: { type: Number, default: null },
+  subscribedAt: Date,
+  lastEarningWithdrawal: Date,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const DepositSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, ref: "User" },
+  email: String,
+  amount: Number,
+  txId: String,
+  txRef: String,
+  status: String,
+  promoApplied: Boolean,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const WithdrawalSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, ref: "User" },
+  type: String,
+  amount: Number,
+  bank: String,
+  accountNumber: String,
+  accountName: String,
+  status: String,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const PromoSchema = new Schema({
+  limit: Number,
+  used: Number
+});
+
+// Models
+const User = mongoose.model("User", UserSchema);
+const Deposit = mongoose.model("Deposit", DepositSchema);
+const Withdrawal = mongoose.model("Withdrawal", WithdrawalSchema);
+const Promo = mongoose.model("Promo", PromoSchema);
+
+/* ---------------------
+  Ensure promo doc exists
+----------------------*/
+async function ensurePromo() {
+  let p = await Promo.findOne();
+  if (!p) {
+    p = new Promo({ limit: Number(process.env.PROMO_LIMIT || 300), used: 0 });
+    await p.save();
+    console.log("✅ Promo doc created");
+  } else {
+    console.log("ℹ️ Promo loaded", p.limit, p.used);
+  }
+}
+ensurePromo();
+
+/* ---------------------
+  Setup
+----------------------*/
 const app = express();
 app.use(cors({
-  origin: [
-    "https://hightechemp.site", // your frontend (Hostinger)
-    "https://www.hightechemp.site" // optional, in case www version is used
-  ],
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  origin: [FRONTEND_URL, `https://www.${new URL(FRONTEND_URL).hostname}`],
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
   credentials: true,
 }));
-
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-/*
-  In-memory demo DB:
-  - users: { id, name, email, password, verified, balance, referralEarnings, referralCode, subscribedAt, lastEarningWithdrawal, packageId, referrals:[] }
-  - deposits: { id, userId, amount, status, txId, createdAt, promoApplied }
-  - withdrawals: { id, userId, type, amount, bank, accountNumber, accountName, status, createdAt }
-  - adsWatched: track per-user per-day how many ads they've watched
-*/
-const users = [];
-const deposits = [];
-const withdrawals = [];
-const adsWatched = {}; // { userId: { yyyy-mm-dd: count } }
-const verifications = {}; // email -> code
-const promo = { limit: Number(process.env.PROMO_LIMIT || 300), used: 0 };
-// ======= ADD: Persistence Helpers =======
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, "utf-8");
-      const json = JSON.parse(raw);
-
-      if (json.users) users.push(...json.users);
-      if (json.deposits) deposits.push(...json.deposits);
-      if (json.withdrawals) withdrawals.push(...json.withdrawals);
-      if (json.promo) {
-        promo.limit = json.promo.limit;
-        promo.used = json.promo.used;
-      }
-      console.log("✅ Data loaded from data.json");
-    } else {
-      console.log("ℹ️ No existing data.json found. Starting fresh.");
-    }
-  } catch (err) {
-    console.error("❌ Error loading data.json:", err);
-  }
-}
-
-function saveData() {
-  try {
-    const data = { users, deposits, withdrawals, promo };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-    console.log("💾 Data saved successfully");
-  } catch (err) {
-    console.error("❌ Error saving data:", err);
-  }
-}
-
-// Packages (exact amounts you requested)
 const PACKAGES = [
   { id: 1, price: 5000, daily: 500 },
   { id: 2, price: 10000, daily: 1000 },
@@ -88,7 +119,7 @@ const PACKAGES = [
 ];
 
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  service: process.env.SMTP_SERVICE || "gmail",
   port: 587,
   secure: false,
   auth: {
@@ -97,623 +128,249 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-
-
-
-// create demo admin user if missing
-const adminEmail = process.env.ADMIN_EMAIL || "oparahraymond72@gmail.com";
-if (!users.find(u => u.email === adminEmail)) {
-  users.push({
-    id: "user_admin",
-    name: "Admin",
-    email: adminEmail,
-    password: process.env.ADMIN_PASS || "admin123",
-    verified: true,
-    balance: 0,
-    referralEarnings: 0,
-    referralCode: "ADMIN",
-    referrals: [],
-    role: "admin",
-    createdAt: new Date()
-  });
-}
-
-/* --------------------
+/* ---------------------
   Helpers
----------------------*/
-function nowISO() { return new Date().toISOString(); }
-function findUserByEmail(email){ return users.find(u => u.email.toLowerCase() === (email||"").toLowerCase()); }
-function findUserById(id){ return users.find(u => u.id === id); }
-function sendAdminEmail(subject, html) {
-  if (!transporter) return Promise.resolve();
-  return transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: process.env.ADMIN_EMAIL || adminEmail,
-    subject,
-    html
-  }).catch(err => console.warn("Admin email error", err));
+----------------------*/
+const nowISO = () => new Date().toISOString();
+
+async function findUserByEmail(email) {
+  return User.findOne({ email: (email||"").toLowerCase() });
 }
 
-/* --------------------
-  Landing / info
----------------------*/
-app.get("/", (req, res) => {
-  res.send("HIGHTECH backend running");
-});
+async function findUserById(id) {
+  return User.findById(id);
+}
 
-// front-end video guide / how it works / logo info
-app.get("/api/siteinfo", (req,res) => {
+/* ---------------------
+  Routes
+----------------------*/
+app.get("/", (req, res) => res.send("HIGHTECH backend running"));
+
+app.get("/api/siteinfo", async (req, res) => {
+  const promo = await Promo.findOne();
   res.json({
     siteName: "HIGHTECH",
     logoText: "HIGHTECH",
-    welcome: "Welcome to HIGHTECH — watch ads, earn daily, withdraw later!",
-    howItWorks: [
-      "Signup or login",
-      "Deposit and choose a package",
-      "Watch 5 ads daily",
-      "Refer friends to earn 10% of their package",
-      "Withdraw per rules (admin approves withdrawals)"
-    ],
-    videoGuide: { title: "How HIGHTECH works", embed: process.env.VIDEO_EMBED_URL || "https://www.youtube.com/embed/dQw4w9WgXcQ" },
+    welcome: "Welcome to HIGHTECH — watch ads, earn daily!",
     promo: { limit: promo.limit, used: promo.used }
   });
 });
 
-/* --------------------
-  Auth & verification
----------------------*/
-// ✅ SIGNUP — no email verification
-app.post("/api/auth/signup", (req, res) => {
+/* Auth */
+app.post("/api/auth/signup", async (req, res) => {
   try {
     const { name, email, password, referralCode } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: "Missing required fields" });
-    }
+    if (!name || !email || !password) return res.status(400).json({ success:false, message:"Missing fields" });
 
-    if (findUserByEmail(email)) {
-      return res.status(400).json({ success: false, message: "Email already registered" });
-    }
+    const exists = await User.findOne({ email: email.toLowerCase() });
+    if (exists) return res.status(400).json({ success:false, message:"Email already registered" });
 
     let referredBy = null;
     if (referralCode) {
-      const refUser = users.find(u => u.referralCode === referralCode);
+      const refUser = await User.findOne({ referralCode });
       if (refUser) {
         referredBy = referralCode;
-        refUser.referrals.push(email);
+        refUser.referrals.push(email.toLowerCase());
+        await refUser.save();
       }
     }
 
-    const newUser = {
-      id: "u_" + Date.now(),
+    const referralCodeGenerated = (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase();
+
+    const user = new User({
       name,
       email: email.toLowerCase(),
       password,
       verified: true,
-      balance: 0,
-      referralEarnings: 0,
-      referrals: [],
-      referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase(),
+      referralCode: referralCodeGenerated,
       referredBy,
-      createdAt: new Date(),
-    };
-    users.push(newUser);
-
-    console.log(`✅ New signup: ${email}`);saveData();
-
-
-    return res.json({
-      success: true,
-      message: "Signup successful",
-      user: { id: newUser.id, email: newUser.email, name: newUser.name },
+      balance: 0,
+      referralEarnings: 0
     });
+    await user.save();
+
+    console.log("✅ New signup", email);
+    return res.json({ success:true, message:"Signup successful", user:{ id:user._id, email:user.email, name:user.name, referralCode:user.referralCode } });
   } catch (err) {
-    console.error("Signup error:", err);
-    return res.status(500).json({ success: false, message: "Server error" });
+    console.error("Signup error", err);
+    return res.status(500).json({ success:false, message:"Server error" });
   }
 });
 
-app.post("/api/auth/verify", (req,res) => {
-  const { email, code } = req.body;
-  if (!email || !code) return res.status(400).json({ success:false, message:"Missing fields" });
-  const expected = verifications[email.toLowerCase()];
-  if (!expected || expected !== code) return res.status(400).json({ success:false, message:"Invalid code" });
-  const user = findUserByEmail(email);
-  if (!user) return res.status(404).json({ success:false, message:"User not found" });
-  user.verified = true;
-  delete verifications[email.toLowerCase()];
-  return res.json({ success:true, message:"Email verified" });
-});
-
-// login
-app.post("/api/auth/login", (req,res) => {
-  const { email, password } = req.body;
-  const user = findUserByEmail(email);
-  if (!user) return res.status(401).json({ success:false, message:"Invalid credentials" });
-  if (user.password !== password) return res.status(401).json({ success:false, message:"Invalid credentials" });
-  if (!user.verified) return res.status(403).json({ success:false, message:"Please verify email" });
-  // return minimal safe user
-  const safe = { id: user.id, name: user.name, email: user.email, balance: user.balance, referralEarnings: user.referralEarnings, referralCode: user.referralCode, packageId: user.packageId, subscribedAt: user.subscribedAt };
-  return res.json({ success:true, user: safe });
-});
-app.get("/api/referrals/:userId", (req, res) => {
+app.post("/api/auth/login", async (req,res) => {
   try {
-    const user = findUserById(req.params.userId);
-    if (!user) return res.status(404).json({ success: false, message: "User not found" });
-    const referredUsers = users.filter(u => u.referredBy === user.referralCode);
-    res.json({
-      success: true,
-      count: referredUsers.length,
-      referrals: referredUsers.map(r => ({
-        id: r.id,
-        name: r.name,
-        email: r.email,
-        joinedAt: r.createdAt,
-      })),
-    });
+    const { email, password } = req.body;
+    const user = await findUserByEmail(email);
+    if (!user || user.password !== password) return res.status(401).json({ success:false, message:"Invalid credentials" });
+    if (!user.verified) return res.status(403).json({ success:false, message:"Please verify email" });
+    const safe = { id: user._id, name: user.name, email: user.email, balance: user.balance, referralEarnings: user.referralEarnings, referralCode: user.referralCode, packageId: user.packageId, subscribedAt: user.subscribedAt };
+    return res.json({ success:true, user: safe });
   } catch (err) {
-    console.error("Referral error:", err);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error(err);
+    res.status(500).json({ success:false, message:"Server error" });
   }
 });
 
+/* Referrals */
+app.get("/api/user/:userId/referrals", async (req,res) => {
+  try {
+    const user = await findUserById(req.params.userId);
+    if (!user) return res.status(404).json({ success:false, message:"User not found" });
+    const referred = await User.find({ referredBy: user.referralCode }).select("name email createdAt");
+    res.json({ success:true, count: referred.length, referrals: referred });
+  } catch (err) {
+    console.error("Referral fetch error", err);
+    res.status(500).json({ success:false, message:"Server error" });
+  }
+});
 
-/* --------------------
-  Packages & subscription
----------------------*/
-
-// list packages
+/* Packages */
 app.get("/api/packages", (req,res) => res.json({ success:true, packages: PACKAGES }));
 
-// subscribe: user must have deposited the package price to balance OR we can force deposit flow
-// For simplicity: frontend will call /api/subscribe after deposit success to mark subscription.
-app.post("/api/subscribe", (req,res) => {
-  const { userId, packageId } = req.body;
-  const user = findUserById(userId);
-  if (!user) return res.status(404).json({ success:false, message:"User not found" });
-  const pkg = PACKAGES.find(p => p.id === Number(packageId) || p.id === packageId);
-  if (!pkg) return res.status(400).json({ success:false, message:"Invalid package" });
-  if (user.balance < pkg.price) return res.status(400).json({ success:false, message:"Insufficient balance. Please deposit the package amount." });
+app.post("/api/subscribe", async (req,res) => {
+  try {
+    const { userId, packageId } = req.body;
+    const user = await findUserById(userId);
+    if (!user) return res.status(404).json({ success:false, message:"User not found" });
+    const pkg = PACKAGES.find(p => String(p.id) === String(packageId));
+    if (!pkg) return res.status(400).json({ success:false, message:"Invalid package" });
+    if (user.balance < pkg.price) return res.status(400).json({ success:false, message:"Insufficient balance" });
 
-  // deduct price, set subscription date
-  user.balance -= pkg.price;
-  user.packageId = pkg.id;
-  user.subscribedAt = new Date();saveData();
-
-
-  // credit referral: 10% of package price to referrer (immediate)
-  if (user.referredBy) {
-    const refUser = users.find(u => u.referralCode === user.referredBy);
-    if (refUser) {
-      const bonus = Math.round(pkg.price * 0.10);
-      refUser.referralEarnings = (refUser.referralEarnings || 0) + bonus;
-      // record deposit-like referral record if desired
+    user.balance -= pkg.price;
+    user.packageId = pkg.id;
+    user.subscribedAt = new Date();
+    // credit referral earnings if any
+    if (user.referredBy) {
+      const ref = await User.findOne({ referralCode: user.referredBy });
+      if (ref) {
+        const bonus = Math.round(pkg.price * 0.10);
+        ref.referralEarnings = (ref.referralEarnings || 0) + bonus;
+        await ref.save();
+      }
     }
+    await user.save();
+    res.json({ success:true, message:"Subscribed", user: { balance: user.balance, packageId: user.packageId } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success:false, message:"Server error" });
   }
-
-  return res.json({ success:true, message:"Subscribed to package", user:{ balance:user.balance, packageId:user.packageId } });
 });
 
-/* --------------------
-  Deposit (Flutterwave init) + callback verify and auto-credit
----------------------*/
-
-app.post("/api/deposit", async (req, res) => {
+/* Deposit init */
+app.post("/api/deposit", async (req,res) => {
   try {
     const { email, amount, name } = req.body;
-    if (!amount || Number(amount) < 5000)
-      return res.status(400).json({ success: false, message: "Minimum ₦5,000" });
+    if (!amount || Number(amount) < 5000) return res.status(400).json({ success:false, message:"Minimum ₦5,000" });
 
     const tx_ref = "hitech_" + Date.now();
     const response = await fetch("https://api.flutterwave.com/v3/payments", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${FLW_SECRET_KEY}`, "Content-Type":"application/json" },
       body: JSON.stringify({
         tx_ref,
         amount: String(amount),
         currency: "NGN",
-        redirect_url: `https://hitech-backend.onrender.com/api/payment/callback`,
+        redirect_url: `${process.env.BACKEND_URL || "https://hitech-backend.onrender.com"}/api/payment/callback`,
         customer: { email, name },
-        customizations: { title: "HIGHTECH Deposit" },
-      }),
+        customizations: { title: "HIGHTECH Deposit" }
+      })
     });
-
     const data = await response.json();
-    if (data.status === "success") return res.json({ success: true, link: data.data.link });
-    res.status(400).json({ success: false, message: data.message || "Failed to init payment" });
+    if (data.status === "success") return res.json({ success:true, link: data.data.link });
+    return res.status(400).json({ success:false, message: data.message || "Failed to init payment" });
   } catch (err) {
-    console.error("Deposit error:", err);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Deposit init error", err);
+    res.status(500).json({ success:false, message:"Server error" });
   }
 });
 
-
+/* Payment callback */
 app.get("/api/payment/callback", async (req, res) => {
   try {
     const { status, transaction_id, tx_ref } = req.query;
-
-    // log incoming callback for debugging
-    console.log("🔔 Payment callback received:", { status, transaction_id, tx_ref });
+    console.log("🔔 Payment callback:", { status, transaction_id, tx_ref });
 
     if (status !== "successful") {
-      // better to redirect to frontend so UX is smooth
       return res.redirect(`${FRONTEND_URL}/dashboard?payment=cancelled`);
     }
 
-    // verify with flutterwave
     const verifyRes = await fetch(`https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`, {
-      headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` }
+      headers: { Authorization: `Bearer ${FLW_SECRET_KEY}` }
     });
     const verifyData = await verifyRes.json();
-
     console.log("🔍 verifyData:", verifyData && verifyData.status ? "OK" : verifyData);
 
     if (!verifyData || verifyData.status !== "success") {
-      console.error("verifyData failed:", verifyData);
       return res.redirect(`${FRONTEND_URL}/dashboard?payment=failed`);
     }
 
     const { amount, customer } = verifyData.data;
     const email = (customer?.email || "").toLowerCase();
 
-    // find or create user
-    let user = findUserByEmail(email);
+    let user = await User.findOne({ email });
     if (!user) {
-      user = {
-        id: "u_" + Date.now(),
+      user = new User({
         name: customer?.name || "HIGHTECH User",
         email,
-        password: "",
-        verified: true,
-        balance: 0,
+        password: "", verified: true, balance: 0,
         referralEarnings: 0,
-        referrals: [],
-        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase(),
-        createdAt: new Date()
-      };
-      users.push(user);
+        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase()
+      });
+      await user.save();
     }
 
     // credit balance
     user.balance = (user.balance || 0) + Number(amount);
 
-    // referral bonus (10%) - credit immediately and persist
+    // referral bonus
     if (user.referredBy) {
-      const referrer = users.find(u => u.referralCode === user.referredBy);
+      const referrer = await User.findOne({ referralCode: user.referredBy });
       if (referrer) {
         const bonus = Math.round(Number(amount) * 0.10);
         referrer.referralEarnings = (referrer.referralEarnings || 0) + bonus;
-        console.log(`🎉 Credited referral bonus ${bonus} to ${referrer.email}`);
+        await referrer.save();
+        console.log(`🎉 Referral bonus ${bonus} credited to ${referrer.email}`);
       }
     }
+    await user.save();
 
-    // record deposit and promo usage
+    // record deposit & promo
+    const promo = await Promo.findOne();
     let promoApplied = false;
-    if (promo.used < promo.limit) {
+    if (promo && promo.used < promo.limit) {
       promo.used += 1;
+      await promo.save();
       promoApplied = true;
     }
 
-    const dep = {
-      id: uuidv4(),
-      userId: user.id,
-      email,                    // store email so you can look up easily later
+    const dep = new Deposit({
+      userId: user._id,
+      email,
       amount: Number(amount),
       txId: transaction_id,
       txRef: tx_ref || null,
       status: "successful",
-      createdAt: new Date(),
       promoApplied
-    };
-    deposits.push(dep);
+    });
+    await dep.save();
 
-    // persist everything now
-    saveData();
-
-    // redirect to frontend dashboard (success)
     return res.redirect(`${FRONTEND_URL}/dashboard?payment=success`);
   } catch (err) {
-    console.error("callback err:", err);
-    // fail gracefully: redirect user to frontend error state
+    console.error("callback err", err);
     return res.redirect(`${FRONTEND_URL}/dashboard?payment=error`);
   }
 });
 
-/* --------------------
-  Webhook (flutterwave)
----------------------*/
-app.post("/api/webhook/flutterwave", (req,res) => {
-  // Keep placeholder; verify signature in production, credit as needed
-  console.log("webhook payload", req.body);
-  res.json({ success:true });
+/* Minimal admin endpoints for listing */
+app.get("/api/admin/users", async (req,res) => {
+  const list = await User.find().select("name email balance referralEarnings createdAt");
+  res.json({ success:true, users: list });
+});
+app.get("/api/admin/deposits", async (req,res) => {
+  const list = await Deposit.find().sort({ createdAt:-1 }).limit(200);
+  res.json({ success:true, deposits: list });
 });
 
-/* --------------------
-  Banks + verify account name
----------------------*/
-// ✅ Get list of Nigerian banks (with Flutterwave + fallback)
-app.get("/api/banks", async (req, res) => {
-  try {
-    const response = await fetch("https://api.flutterwave.com/v3/banks/NG", {
-      headers: {
-        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
-      },
-    });
-
-    const data = await response.json();
-
-    // If Flutterwave returns valid bank data
-    if (data && data.data && Array.isArray(data.data)) {
-      return res.json(data.data);
-    } else {
-      throw new Error("Invalid bank data from Flutterwave");
-    }
-
-  } catch (error) {
-    console.error("banks error:", error.message);
-
-    // 👇 fallback bank list so frontend doesn’t break
-    return res.json([
-      { code: "044", name: "Access Bank" },
-      { code: "011", name: "First Bank of Nigeria" },
-      { code: "058", name: "GTBank" },
-      { code: "033", name: "UBA" },
-      { code: "232", name: "Sterling Bank" },
-      { code: "221", name: "Stanbic IBTC Bank" },
-      { code: "068", name: "Standard Chartered Bank" },
-      { code: "101", name: "Providus Bank" },
-      { code: "076", name: "Polaris Bank" },
-      { code: "082", name: "Keystone Bank" },
-    ]);
-  }
-});
-
-
-app.post("/api/verify-account", async (req,res) => {
-  try {
-    const { account_number, account_bank } = req.body;
-    if (!account_number || !account_bank) return res.status(400).json({ success:false, message:"Missing fields" });
-    const r = await fetch("https://api.flutterwave.com/v3/accounts/resolve", {
-      method:"POST",
-      headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`, "Content-Type":"application/json" },
-      body: JSON.stringify({ account_number, account_bank })
-    });
-    const data = await r.json();
-    if (data.status === "success") return res.json({ success:true, account_name: data.data.account_name, account_number: data.data.account_number });
-    return res.status(400).json({ success:false, message: data.message || "Verification failed" });
-  } catch (err) {
-    console.error("verify err", err);
-    return res.status(500).json({ success:false, message:"Server error" });
-  }
-});
-
-/* --------------------
-  Withdraw request (manual)
-  - referral withdrawal: min 5000, withdraw anytime
-  - earning withdrawal: allowed only every 7 days from subscription or last withdrawal
----------------------*/
-app.post("/api/withdraw", async (req,res) => {
-  try {
-    const { userId, type, amount, bank, accountNumber, accountName } = req.body;
-    const user = findUserById(userId);
-    if (!user) return res.status(404).json({ success:false, message:"User not found" });
-
-    const amt = Number(amount || 0);
-    if (!amt || amt <= 0) return res.status(400).json({ success:false, message:"Invalid amount" });
-
-    if (type === "referral") {
-      if (user.referralEarnings < 5000) return res.status(400).json({ success:false, message:"Referral minimum withdrawal is ₦5,000" });
-      if (amt > user.referralEarnings) return res.status(400).json({ success:false, message:"Not enough referral balance" });
-      user.referralEarnings -= amt;
-    } else if (type === "earning") {
-      // check 7 days rule
-      const allowFrom = user.subscribedAt ? new Date(user.subscribedAt) : null;
-      const last = user.lastEarningWithdrawal ? new Date(user.lastEarningWithdrawal) : allowFrom;
-      if (!last) return res.status(400).json({ success:false, message:"You must subscribe to a package first" });
-      const daysSince = (Date.now() - last.getTime()) / (1000*60*60*24);
-      if (daysSince < 7) return res.status(400).json({ success:false, message:"Earning withdrawals allowed once every 7 days" });
-      if (amt > user.balance) return res.status(400).json({ success:false, message:"Insufficient wallet balance" });
-      user.balance -= amt;
-      user.lastEarningWithdrawal = new Date();
-    } else {
-      return res.status(400).json({ success:false, message:"Invalid withdrawal type" });
-    }
-
-    // create withdraw request (admin will approve)
-    const w = { id: uuidv4(), userId: user.id, type, amount: amt, bank, accountNumber, accountName, status: "pending", createdAt: new Date() };
-    withdrawals.push(w);saveData();
-
-
-    // notify admin by email
-    const subject = `New withdrawal request (${type}) ₦${amt}`;
-    const html = `<p>User ${user.email} requested withdrawal ₦${amt} - ${type}</p>
-                  <p>Account: ${accountName} (${accountNumber}), Bank: ${bank}</p>`;
-    sendAdminEmail(subject, html).catch(e=>console.warn("notify admin err", e));
-
-    return res.json({ success:true, withdrawal: w, message:"Withdrawal request placed. Admin will process within 24 hours." });
-  } catch (err) {
-    console.error("withdraw err", err);
-    return res.status(500).json({ success:false, message:"Server error" });
-  }
-});
-
-/* --------------------
-  Admin endpoints
----------------------*/
-app.get("/api/admin/withdrawals", (req,res) => res.json({ success:true, withdrawals }));
-app.get("/api/admin/deposits", (req,res) => res.json({ success:true, deposits }));
-app.get("/api/admin/users", (req,res) => res.json({ success:true, users: users.map(u => ({ id:u.id, email:u.email, name:u.name, balance:u.balance, referralEarnings:u.referralEarnings })) }));
-
-// approve withdrawal (admin)
-app.post("/api/admin/withdrawals/:id/approve", (req,res) => {
-  const id = req.params.id;
-  const w = withdrawals.find(x => x.id === id);
-  if (!w) return res.status(404).json({ success:false, message:"Not found" });
-  w.status = "approved";saveData();
-  // In production: call payout API or mark as paid after manual transfer
-  return res.json({ success:true, w });
-});
-
-/* --------------------
-  Ads / watch tracking endpoints
-  - mark watched ad (frontend calls when ad finished)
-  - get remaining ads count for user today (max 5)
----------------------*/
-app.post("/api/ads/watch", (req,res) => {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ success:false, message:"Missing userId" });
-  const d = new Date(); const key = d.toISOString().slice(0,10);
-  if (!adsWatched[userId]) adsWatched[userId] = {};
-  if (!adsWatched[userId][key]) adsWatched[userId][key] = 0;
-  if (adsWatched[userId][key] >= 5) return res.status(400).json({ success:false, message:"Daily ad limit reached" });
-  adsWatched[userId][key] += 1;
-  // credit daily earning only when user has package and only after watching 5 ads? Business rule: you said "watch 5 ads daily" — assume earnings accumulate daily and admin/manual cron handles daily credit. For demo we will not auto-credit here.
-  return res.json({ success:true, watched: adsWatched[userId][key] });
-});
-
-app.get("/api/ads/status", (req,res) => {
-  const { userId } = req.query;
-  if (!userId) return res.json({ success:true, remaining:5 });
-  const key = (new Date()).toISOString().slice(0,10);
-  const count = (adsWatched[userId] && adsWatched[userId][key]) || 0;
-  return res.json({ success:true, watched: count, remaining: Math.max(0,5-count) });
-});
-
-/* --------------------
-  Promo & stats endpoint
---------------------*/
-app.get("/api/promo", (req,res) => {
-  return res.json({ success:true, limit: promo.limit, used: promo.used, remaining: Math.max(0, promo.limit - promo.used) });
-});
-
-// near top of server.js - set base starters (can also use env vars)
-const BASE_USERS = Number(process.env.BASE_USERS || 10000);
-const BASE_DEPOSITS = Number(process.env.BASE_DEPOSITS || 9500);
-
-// statistics + rotating testimonials endpoint
-app.get("/api/stats", (req, res) => {
-  try {
-    // real counts from in-memory arrays
-    const realUsersCount = users.length;         // actual signed up users in memory
-    const realDepositsTotal = deposits.reduce((s, d) => s + (d.amount || 0), 0);
-    const realDepositsCount = deposits.length;  // or total amount if you prefer
-
-    // combine baseline + real
-    const totalUsers = BASE_USERS + realUsersCount;
-    const totalDepositCount = BASE_DEPOSITS + realDepositsCount;
-    const totalDepositAmount = (BASE_DEPOSITS * 5000) + realDepositsTotal; 
-    // (note: above uses assumption baseline deposit amount — adjust if you want to treat baseline as count or amount)
-
-    // rotating/fresh testimonials: store array and pick different ordering each call
-    const testimonialsPool = [
-      { name: "Ada", text: "I started earning within days!" },
-      { name: "Chidi", text: "Reliable payouts — I love HIGHTECH" },
-      { name: "Amaka", text: "Simple and transparent." },
-      { name: "Sule", text: "Great UX and smooth withdrawals." },
-      { name: "Ife", text: "Earned daily with no stress." }
-    ];
-
-    // Rotate testimonials by shifting starting index using time (gives change across requests)
-    const idx = Math.floor(Date.now() / (1000 * 60 * 60)) % testimonialsPool.length; // changes every hour
-    const rotated = testimonialsPool.slice(idx).concat(testimonialsPool.slice(0, idx));
-
-    return res.json({
-      success: true,
-      stats: {
-        users: totalUsers,
-        depositsCount: totalDepositCount,
-        depositsAmount: totalDepositAmount,
-        dailyActive: Math.min(totalUsers, Math.floor(Math.random() * 200) + 5)
-      },
-      testimonials: rotated.slice(0, 3) // send top 3 in rotating order
-    });
-  } catch (err) {
-    console.error("stats err", err);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-
-/* --------------------
-  Video guide endpoint
---------------------*/
-app.get("/api/video-guide", (req,res) => {
-  res.json({ success:true, embed: process.env.VIDEO_EMBED_URL || "https://www.youtube.com/embed/dQw4w9WgXcQ", text:"How HIGHTECH works" });
-});
-
-/* --------------------
-  Serve production frontend (optional)
----------------------*/
-// If you build frontend to ../frontend/build, uncomment serving block below
-/*
-import path from "path";
-import { fileURLToPath } from "url";
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-app.use(express.static(path.join(__dirname,"../frontend/build")));
-app.get("*",(req,res) => res.sendFile(path.join(__dirname,"../frontend/build","index.html")));
-*/
-/* --------------------
-  New endpoint: /api/watch-ad
-  Tracks ads watched and auto-rewards ROI when all 5 are done
----------------------*/
-app.post("/api/watch-ad", (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ success: false, message: "Missing userId" });
-
-    const user = findUserById(userId);
-    if (!user) return res.status(404).json({ success: false, message: "User not found" });
-    if (!user.packageId) return res.status(400).json({ success: false, message: "You must subscribe to a package first" });
-
-    const today = new Date().toISOString().slice(0, 10);
-
-    // init tracking if not exist
-    if (!adsWatched[userId]) adsWatched[userId] = {};
-    if (!adsWatched[userId][today]) adsWatched[userId][today] = { count: 0, rewarded: false };
-
-    const userAds = adsWatched[userId][today];
-
-    // Check if already rewarded
-    if (userAds.rewarded) {
-      return res.json({ success: false, message: "Today's ROI already credited", watched: 5 });
-    }
-
-    // Increment watch count
-    if (userAds.count >= 5) {
-      return res.json({ success: false, message: "Daily ad limit reached", watched: 5 });
-    }
-
-    userAds.count += 1;
-
-    // When 5 ads watched, credit ROI
-    if (userAds.count === 5) {
-      const pkg = PACKAGES.find(p => p.id === user.packageId);
-      if (pkg) {
-        user.balance = (user.balance || 0) + pkg.daily; // credit ROI
-        userAds.rewarded = true;
-        console.log(`💰 Credited ₦${pkg.daily} ROI to ${user.email}`);
-      }
-    }
-
-    return res.json({
-      success: true,
-      message:
-        userAds.count === 5
-          ? "✅ You’ve completed today’s 5 ads. ROI credited to your wallet!"
-          : `Ad ${userAds.count}/5 watched successfully.`,
-      watched: userAds.count,
-      rewarded: userAds.rewarded,
-      newBalance: user.balance,
-    });
-  } catch (err) {
-    console.error("watch-ad err", err);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-// ======= ADD: Load saved data at startup =======
-loadData();
+/* Start */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 HIGHTECH backend listening on ${PORT}`));
