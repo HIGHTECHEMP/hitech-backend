@@ -255,6 +255,31 @@ app.post("/api/subscribe", async (req,res) => {
     res.status(500).json({ success:false, message:"Server error" });
   }
 });
+app.get("/api/videos/random", (req, res) => {
+  const videos = [
+    "dQw4w9WgXcQ",
+    "3JZ_D3ELwOQ",
+    "M7lc1UVf-VE",
+    "hY7m5jjJ9mM",
+    "eVTXPUF4Oz4",
+  ];
+  const randomId = videos[Math.floor(Math.random() * videos.length)];
+  res.json({ videoId: randomId });
+});
+
+// credits user
+app.post("/api/user/:userId/credit", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    user.balance += 50;
+    await user.save();
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Credit error:", err);
+    res.status(500).json({ success: false });
+  }
+});
 
 /* Deposit init */
 app.post("/api/deposit", async (req,res) => {
@@ -285,81 +310,41 @@ app.post("/api/deposit", async (req,res) => {
 });
 
 /* Payment callback */
-app.get("/api/payment/callback", async (req, res) => {
+import axios from "axios";
+import User from "./models/User.js";
+
+app.post("/api/payment/callback", async (req, res) => {
   try {
-    const { status, transaction_id, tx_ref } = req.query;
-    console.log("🔔 Payment callback:", { status, transaction_id, tx_ref });
+    const { tx_ref, status, transaction_id } = req.body;
 
     if (status !== "successful") {
-      return res.redirect(`${FRONTEND_URL}/dashboard?payment=cancelled`);
+      return res.status(400).json({ success: false, message: "Payment not successful" });
     }
 
-    const verifyRes = await fetch(`https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`, {
-      headers: { Authorization: `Bearer ${FLW_SECRET_KEY}` }
+    // verify transaction with Flutterwave
+    const verifyUrl = `https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`;
+
+    const verifyResponse = await axios.get(verifyUrl, {
+      headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` },
     });
-    const verifyData = await verifyRes.json();
-    console.log("🔍 verifyData:", verifyData && verifyData.status ? "OK" : verifyData);
 
-    if (!verifyData || verifyData.status !== "success") {
-      return res.redirect(`${FRONTEND_URL}/dashboard?payment=failed`);
-    }
-
-    const { amount, customer } = verifyData.data;
-    const email = (customer?.email || "").toLowerCase();
-
-    let user = await User.findOne({ email });
-    if (!user) {
-      user = new User({
-        name: customer?.name || "HIGHTECH User",
-        email,
-        password: "", verified: true, balance: 0,
-        referralEarnings: 0,
-        referralCode: (email.split("@")[0] + Math.floor(Math.random() * 9000)).toUpperCase()
-      });
-      await user.save();
-    }
-
-    // credit balance
-    user.balance = (user.balance || 0) + Number(amount);
-
-    // referral bonus
-    if (user.referredBy) {
-      const referrer = await User.findOne({ referralCode: user.referredBy });
-      if (referrer) {
-        const bonus = Math.round(Number(amount) * 0.10);
-        referrer.referralEarnings = (referrer.referralEarnings || 0) + bonus;
-        await referrer.save();
-        console.log(`🎉 Referral bonus ${bonus} credited to ${referrer.email}`);
+    const data = verifyResponse.data.data;
+    if (data.status === "successful") {
+      const user = await User.findOne({ tx_ref });
+      if (user) {
+        user.balance += data.amount;
+        await user.save();
       }
+      return res.status(200).json({ success: true, message: "Payment verified and user credited" });
+    } else {
+      return res.status(400).json({ success: false, message: "Verification failed" });
     }
-    await user.save();
-
-    // record deposit & promo
-    const promo = await Promo.findOne();
-    let promoApplied = false;
-    if (promo && promo.used < promo.limit) {
-      promo.used += 1;
-      await promo.save();
-      promoApplied = true;
-    }
-
-    const dep = new Deposit({
-      userId: user._id,
-      email,
-      amount: Number(amount),
-      txId: transaction_id,
-      txRef: tx_ref || null,
-      status: "successful",
-      promoApplied
-    });
-    await dep.save();
-
-    return res.redirect(`${FRONTEND_URL}/dashboard?payment=success`);
   } catch (err) {
-    console.error("callback err", err);
-    return res.redirect(`${FRONTEND_URL}/dashboard?payment=error`);
+    console.error("Payment callback error:", err);
+    res.status(500).json({ success: false, message: "Server error during payment callback" });
   }
 });
+
 
 /* Minimal admin endpoints for listing */
 app.get("/api/admin/users", async (req,res) => {
