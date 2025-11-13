@@ -423,7 +423,7 @@ app.get("/api/admin/deposits", async (req, res) => {
   res.json({ success: true, deposits: list });
 });
 // ✅ Get list of all Nigerian banks
-import fetch from "node-fetch"; // if not already imported
+
 
 app.get("/banks", async (req, res) => {
   try {
