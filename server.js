@@ -281,69 +281,126 @@ app.post("/api/user/:userId/credit", async (req, res) => {
   }
 });
 
-/* Deposit init */
-app.post("/api/deposit", async (req,res) => {
-  try {
-    const { email, amount, name } = req.body;
-    if (!amount || Number(amount) < 5000) return res.status(400).json({ success:false, message:"Minimum ₦5,000" });
+import axios from "axios";
+import Deposit from "./models/Deposit.js";
+import User from "./models/User.js";
 
-    const tx_ref = "hitech_" + Date.now();
-    const response = await fetch("https://api.flutterwave.com/v3/payments", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${FLW_SECRET_KEY}`, "Content-Type":"application/json" },
-      body: JSON.stringify({
-        tx_ref,
-        amount: String(amount),
-        currency: "NGN",
-        redirect_url: `${process.env.BACKEND_URL || "https://hitech-backend.onrender.com"}/api/payment/callback`,
-        customer: { email, name },
-        customizations: { title: "HIGHTECH Deposit" }
-      })
+app.post("/api/deposit", async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+
+    if (!userId || !amount) {
+      return res.status(400).json({ success: false, message: "Missing fields" });
+    }
+
+    if (Number(amount) < 5000) {
+      return res.status(400).json({ success: false, message: "Minimum deposit is ₦5,000" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const txRef = `HT-${Date.now()}`;
+
+    // Save pending deposit
+    const deposit = new Deposit({
+      userId: user._id,
+      email: user.email,
+      amount,
+      txRef,
+      status: "pending",
     });
-    const data = await response.json();
-    if (data.status === "success") return res.json({ success:true, link: data.data.link });
-    return res.status(400).json({ success:false, message: data.message || "Failed to init payment" });
+    await deposit.save();
+
+    // Create payment link
+    const response = await axios.post(
+      "https://api.flutterwave.com/v3/payments",
+      {
+        tx_ref: txRef,
+        amount,
+        currency: "NGN",
+        redirect_url: `${process.env.BACKEND_URL}/api/payment/callback`,
+        customer: { email: user.email, name: user.name },
+        customizations: { title: "HIGHTECH Deposit" },
+      },
+      { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } }
+    );
+
+    if (response.data.status === "success") {
+      return res.json({ success: true, link: response.data.data.link });
+    }
+
+    return res.status(400).json({ success: false, message: "Failed to initialize payment" });
   } catch (err) {
-    console.error("Deposit init error", err);
-    res.status(500).json({ success:false, message:"Server error" });
+    console.error("❌ Deposit init error:", err);
+    res.status(500).json({ success: false, message: "Server error during deposit" });
   }
 });
 
-/* Payment callback */
-import axios from "axios";
-import User from "./models/User.js";
+
 
 app.post("/api/payment/callback", async (req, res) => {
   try {
-    const { tx_ref, status, transaction_id } = req.body;
+    const { transaction_id, tx_ref, status } = req.body;
 
-    if (status !== "successful") {
-      return res.status(400).json({ success: false, message: "Payment not successful" });
+    if (!transaction_id || status !== "successful") {
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=failed`);
     }
 
-    // verify transaction with Flutterwave
+    // Verify with Flutterwave
     const verifyUrl = `https://api.flutterwave.com/v3/transactions/${transaction_id}/verify`;
-
     const verifyResponse = await axios.get(verifyUrl, {
       headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` },
     });
 
-    const data = verifyResponse.data.data;
-    if (data.status === "successful") {
-      const user = await User.findOne({ tx_ref });
-      if (user) {
-        user.balance += data.amount;
-        await user.save();
-      }
-      return res.status(200).json({ success: true, message: "Payment verified and user credited" });
-    } else {
-      return res.status(400).json({ success: false, message: "Verification failed" });
+    const data = verifyResponse.data?.data;
+    if (!data || data.status !== "successful") {
+      console.error("❌ Flutterwave verification failed:", verifyResponse.data);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=failed`);
     }
+
+    // Find the deposit
+    const deposit = await Deposit.findOne({ txRef: tx_ref || data.tx_ref });
+    if (!deposit) {
+      console.error("❌ Deposit not found for tx_ref:", tx_ref);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=failed`);
+    }
+
+    // Avoid duplicate credits
+    if (deposit.status === "successful") {
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=success`);
+    }
+
+    // Verify amount match
+    if (Number(deposit.amount) !== Number(data.amount)) {
+      console.error("⚠️ Amount mismatch for", tx_ref);
+      return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=failed`);
+    }
+
+    // Update deposit
+    deposit.status = "successful";
+    deposit.gatewayResponse = JSON.stringify(data);
+    await deposit.save();
+
+    // Credit user
+    const user = await User.findById(deposit.userId);
+    if (user) {
+      user.balance = (user.balance || 0) + Number(data.amount);
+      await user.save();
+      console.log(`💰 Credited ${user.email} ₦${data.amount}`);
+    }
+
+    // Redirect back
+    return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=success`);
   } catch (err) {
-    console.error("Payment callback error:", err);
-    res.status(500).json({ success: false, message: "Server error during payment callback" });
+    console.error("❌ Payment callback error:", err);
+    return res.redirect(`${process.env.FRONTEND_URL}/dashboard?payment=failed`);
   }
 });
+
+
 
 
 /* Minimal admin endpoints for listing */

@@ -1,14 +1,13 @@
 import mongoose from "mongoose";
 
-const depositSchema = new mongoose.Schema({
-  userId: String,
-  email: String,
-  amount: Number,
-  txId: String,
-  txRef: String,
-  status: String,
-  promoApplied: Boolean,
+const DepositSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  email: { type: String, required: true },
+  amount: { type: Number, required: true },
+  txRef: { type: String, required: true, unique: true },
+  status: { type: String, default: "pending" }, // pending | successful | failed
+  gatewayResponse: { type: String },
   createdAt: { type: Date, default: Date.now },
 });
 
-export default mongoose.model("Deposit", depositSchema);
+export default mongoose.model("Deposit", DepositSchema);
