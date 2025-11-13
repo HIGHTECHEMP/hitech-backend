@@ -422,6 +422,69 @@ app.get("/api/admin/deposits", async (req, res) => {
   const list = await Deposit.find().sort({ createdAt: -1 }).limit(200);
   res.json({ success: true, deposits: list });
 });
+// ✅ Get list of all Nigerian banks
+import fetch from "node-fetch"; // if not already imported
+
+app.get("/banks", async (req, res) => {
+  try {
+    const response = await fetch("https://api.flutterwave.com/v3/banks/NG", {
+      headers: {
+        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`, // make sure this key is in your .env file
+      },
+    });
+
+    const data = await response.json();
+
+    if (data.status === "success" && Array.isArray(data.data)) {
+      // Sort banks alphabetically
+      const sorted = data.data.sort((a, b) => a.name.localeCompare(b.name));
+      return res.json(sorted);
+    } else {
+      return res.json([]);
+    }
+  } catch (err) {
+    console.error("Bank list fetch failed:", err);
+    return res.status(500).json({ error: "Failed to fetch banks" });
+  }
+});
+// ✅ Verify bank account number with Flutterwave
+app.post("/verify-account", async (req, res) => {
+  try {
+    const { account_number, account_bank } = req.body;
+    if (!account_number || !account_bank) {
+      return res.status(400).json({ success: false, message: "Missing fields" });
+    }
+
+    const response = await fetch("https://api.flutterwave.com/v3/accounts/resolve", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
+      },
+      body: JSON.stringify({
+        account_number,
+        account_bank,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.status === "success") {
+      return res.json({
+        success: true,
+        account_name: data.data.account_name,
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: data.message || "Failed to verify account",
+      });
+    }
+  } catch (err) {
+    console.error("Error verifying account:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 /* START SERVER */
 const PORT = process.env.PORT || 10000;
